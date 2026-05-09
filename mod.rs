@@ -32,6 +32,24 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use crate::{Canvas, plugin::QuartzPlugin};
 
+/// Typed command payloads for `Action::PluginCall` targeting `terrain_collision`.
+#[derive(Clone, Debug)]
+pub enum TerrainCollisionCall {
+    /// Ensures a dynamic object has an up-to-date pixel outline for this image payload.
+    ///
+    /// If the object's current active key already matches this image+settings, no rebuild occurs.
+    EnsureDynamicOutlineForImage {
+        name: String,
+        rgba_bytes: Vec<u8>,
+        sprite_dims: (u32, u32),
+        object_size: (f32, f32),
+        threshold: u8,
+        rdp_epsilon: f32,
+    },
+    /// Removes the dynamic outline for an object and clears its active outline key.
+    UnregisterDynamicOutline { name: String },
+}
+
 // ── Vec2 (private) ────────────────────────────────────────────────────────────
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -136,6 +154,7 @@ struct SatResult {
 pub struct TerrainCollisionPlugin {
     terrain:          HashMap<String, CollisionOutline>,
     dynamic_outlines: HashMap<String, CollisionOutline>,
+    dynamic_outline_active_keys: HashMap<String, u64>,
     explicit_dynamic: Vec<String>,
     groups:           HashMap<String, CollisionGroup>,
     outline_cache:    HashMap<u64, Arc<CollisionOutlineData>>,
@@ -148,6 +167,7 @@ impl TerrainCollisionPlugin {
         Self {
             terrain:          HashMap::new(),
             dynamic_outlines: HashMap::new(),
+            dynamic_outline_active_keys: HashMap::new(),
             explicit_dynamic: Vec::new(),
             groups:           HashMap::new(),
             outline_cache:    HashMap::new(),
@@ -166,6 +186,18 @@ impl TerrainCollisionPlugin {
         rdp_epsilon: f32,
     ) -> Option<CollisionOutline> {
         let key = outline_cache_key(rgba_bytes, sprite_dims.0, sprite_dims.1, object_size, threshold, rdp_epsilon);
+        self.get_or_build_for_key(key, rgba_bytes, sprite_dims, object_size, threshold, rdp_epsilon)
+    }
+
+    fn get_or_build_for_key(
+        &mut self,
+        key: u64,
+        rgba_bytes: &[u8],
+        sprite_dims: (u32, u32),
+        object_size: (f32, f32),
+        threshold: u8,
+        rdp_epsilon: f32,
+    ) -> Option<CollisionOutline> {
         if let Some(data) = self.outline_cache.get(&key) {
             return Some(CollisionOutline { data: Arc::clone(data) });
         }
@@ -225,15 +257,70 @@ impl TerrainCollisionPlugin {
         threshold:   u8,
         rdp_epsilon: f32,
     ) -> bool {
-        match self.get_or_build(rgba_bytes, sprite_dims, object_size, threshold, rdp_epsilon) {
-            Some(o) => { self.dynamic_outlines.insert(name.into(), o); true }
-            None    => false,
+        let name = name.into();
+        let key = outline_cache_key(
+            rgba_bytes,
+            sprite_dims.0,
+            sprite_dims.1,
+            object_size,
+            threshold,
+            rdp_epsilon,
+        );
+        match self.get_or_build_for_key(key, rgba_bytes, sprite_dims, object_size, threshold, rdp_epsilon) {
+            Some(o) => {
+                self.dynamic_outlines.insert(name.clone(), o);
+                self.dynamic_outline_active_keys.insert(name, key);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Ensures a dynamic outline exists for the object's current image payload.
+    ///
+    /// If the cached key for `name` already matches, this is a cheap no-op.
+    pub fn ensure_dynamic_outline_for_image(
+        &mut self,
+        name: impl Into<String>,
+        rgba_bytes: &[u8],
+        sprite_dims: (u32, u32),
+        object_size: (f32, f32),
+        threshold: u8,
+        rdp_epsilon: f32,
+    ) -> bool {
+        let name = name.into();
+        let key = outline_cache_key(
+            rgba_bytes,
+            sprite_dims.0,
+            sprite_dims.1,
+            object_size,
+            threshold,
+            rdp_epsilon,
+        );
+
+        if self.dynamic_outline_active_keys.get(&name).copied() == Some(key) {
+            return true;
+        }
+
+        match self.get_or_build_for_key(key, rgba_bytes, sprite_dims, object_size, threshold, rdp_epsilon) {
+            Some(o) => {
+                self.dynamic_outlines.insert(name.clone(), o);
+                self.dynamic_outline_active_keys.insert(name, key);
+                true
+            }
+            None => false,
         }
     }
 
     /// Remove a dynamic object's pixel outline (reverts it to AABB collision).
     pub fn unregister_dynamic_outline(&mut self, name: &str) {
         self.dynamic_outlines.remove(name);
+        self.dynamic_outline_active_keys.remove(name);
+    }
+
+    /// Returns the current active outline key for a dynamic object, if tracked.
+    pub fn active_dynamic_outline_key(&self, name: &str) -> Option<u64> {
+        self.dynamic_outline_active_keys.get(name).copied()
     }
 
     /// Force-include a named object as a dynamic collision target even if
@@ -385,7 +472,7 @@ impl QuartzPlugin for TerrainCollisionPlugin {
             return true;
         }
         if let Some(name) = data.strip_prefix("unregister_dynamic_outline:") {
-            self.dynamic_outlines.remove(name);
+            self.unregister_dynamic_outline(name);
             return true;
         }
         if let Some(name) = data.strip_prefix("remove_group:") {
@@ -395,6 +482,33 @@ impl QuartzPlugin for TerrainCollisionPlugin {
         if let Some(name) = data.strip_prefix("rebuild:") {
             self.clear_group(name);
             return true;
+        }
+        false
+    }
+
+    fn on_call(&mut self, _canvas: &mut Canvas, payload: &dyn std::any::Any) -> bool {
+        if let Some(cmd) = payload.downcast_ref::<TerrainCollisionCall>() {
+            return match cmd {
+                TerrainCollisionCall::EnsureDynamicOutlineForImage {
+                    name,
+                    rgba_bytes,
+                    sprite_dims,
+                    object_size,
+                    threshold,
+                    rdp_epsilon,
+                } => self.ensure_dynamic_outline_for_image(
+                    name.clone(),
+                    rgba_bytes,
+                    *sprite_dims,
+                    *object_size,
+                    *threshold,
+                    *rdp_epsilon,
+                ),
+                TerrainCollisionCall::UnregisterDynamicOutline { name } => {
+                    self.unregister_dynamic_outline(name);
+                    true
+                }
+            };
         }
         false
     }
