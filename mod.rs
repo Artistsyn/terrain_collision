@@ -46,6 +46,20 @@ pub enum TerrainCollisionCall {
         threshold: u8,
         rdp_epsilon: f32,
     },
+    /// Sets a specific pre-decoded image as the collision source for a dynamic object.
+    ///
+    /// Preferred over `EnsureDynamicOutlineForImage` when the caller already holds an
+    /// `Arc<image::RgbaImage>` (e.g. a specific GIF frame, a secondary sprite, or a
+    /// procedurally generated mask). The Arc is shared — no extra byte copies at the
+    /// call site. The key cache ensures no outline rebuild occurs if the same image
+    /// object has already been registered for this object.
+    PinCollisionImage {
+        name: String,
+        image: std::sync::Arc<image::RgbaImage>,
+        object_size: (f32, f32),
+        threshold: u8,
+        rdp_epsilon: f32,
+    },
     /// Removes the dynamic outline for an object and clears its active outline key.
     UnregisterDynamicOutline { name: String },
 }
@@ -81,6 +95,7 @@ impl Vec2 {
 #[derive(Debug)]
 struct CollisionOutlineData {
     hulls:         Vec<Vec<Vec2>>,
+    object_size:   (f32, f32),
     sprite_width:  u32,
     sprite_height: u32,
     threshold:     u8,
@@ -95,10 +110,14 @@ pub struct CollisionOutline {
 
 impl CollisionOutline {
     fn world_hulls(&self, position: Vec2, rotation: f32) -> Vec<Vec<Vec2>> {
+        let center = position.add(Vec2::new(
+            self.data.object_size.0 * 0.5,
+            self.data.object_size.1 * 0.5,
+        ));
         let has_rotation = rotation.abs() > 1e-6;
         self.data.hulls.iter().map(|hull| {
             hull.iter().map(|v| {
-                if has_rotation { v.rotate(rotation).add(position) } else { v.add(position) }
+                if has_rotation { v.rotate(rotation).add(center) } else { v.add(center) }
             }).collect()
         }).collect()
     }
@@ -358,6 +377,64 @@ impl TerrainCollisionPlugin {
     pub fn clear_group(&mut self, group_name: &str) {
         if let Some(g) = self.groups.get_mut(group_name) { g.members.clear(); }
     }
+
+    /// Register a dynamic outline from a pre-decoded `Arc<image::RgbaImage>` at init time.
+    ///
+    /// Equivalent to `register_dynamic_outline` but accepts a shared image directly —
+    /// no manual byte extraction required. Use when a specific frame or mask image
+    /// (rather than the object's displayed sprite) should define the collision hull.
+    pub fn register_dynamic_outline_from_image(
+        &mut self,
+        name:        impl Into<String>,
+        image:       &std::sync::Arc<image::RgbaImage>,
+        object_size: (f32, f32),
+        threshold:   u8,
+        rdp_epsilon: f32,
+    ) -> bool {
+        let (w, h) = (image.width(), image.height());
+        if w == 0 || h == 0 { return false; }
+        self.register_dynamic_outline(name, image.as_raw(), (w, h), object_size, threshold, rdp_epsilon)
+    }
+
+    /// Returns transformed world hulls for a dynamic outline if present.
+    ///
+    /// The polygon vertices are returned in world-space coordinates, after
+    /// applying the requested position and rotation.
+    pub fn dynamic_outline_world_hulls(
+        &self,
+        name: &str,
+        outline_position: (f32, f32),
+        outline_rotation: f32,
+    ) -> Option<Vec<Vec<(f32, f32)>>> {
+        let outline = self.dynamic_outlines.get(name)?;
+        let hulls = outline.world_hulls(Vec2::from_tuple(outline_position), outline_rotation);
+        Some(
+            hulls.into_iter()
+                .map(|h| h.into_iter().map(|v| (v.x, v.y)).collect())
+                .collect(),
+        )
+    }
+
+    /// Returns whether a circle overlaps a cached dynamic outline for `name`.
+    ///
+    /// `None` means no dynamic outline is currently cached for the object.
+    pub fn circle_overlaps_dynamic_outline(
+        &self,
+        name: &str,
+        circle_center: (f32, f32),
+        circle_radius: f32,
+        outline_position: (f32, f32),
+        outline_rotation: f32,
+    ) -> Option<bool> {
+        let outline = self.dynamic_outlines.get(name)?;
+        Some(circle_overlaps_outline(
+            Vec2::from_tuple(circle_center),
+            circle_radius,
+            outline,
+            Vec2::from_tuple(outline_position),
+            outline_rotation,
+        ))
+    }
 }
 
 impl Default for TerrainCollisionPlugin {
@@ -368,6 +445,9 @@ impl Default for TerrainCollisionPlugin {
 
 impl QuartzPlugin for TerrainCollisionPlugin {
     fn name(&self) -> &str { "terrain_collision" }
+
+    fn as_any(&self) -> &dyn std::any::Any { self }
+    fn as_any_mut(&mut self) -> &mut dyn std::any::Any { self }
 
     fn on_post_update(&mut self, canvas: &mut Canvas, _dt: f32) {
         let terrain_names: HashSet<&str> = self.terrain.keys().map(String::as_str).collect();
@@ -504,6 +584,25 @@ impl QuartzPlugin for TerrainCollisionPlugin {
                     *threshold,
                     *rdp_epsilon,
                 ),
+                TerrainCollisionCall::PinCollisionImage {
+                    name,
+                    image,
+                    object_size,
+                    threshold,
+                    rdp_epsilon,
+                } => {
+                    let w = image.width();
+                    let h = image.height();
+                    if w == 0 || h == 0 { return false; }
+                    self.ensure_dynamic_outline_for_image(
+                        name.clone(),
+                        image.as_raw(),
+                        (w, h),
+                        *object_size,
+                        *threshold,
+                        *rdp_epsilon,
+                    )
+                }
                 TerrainCollisionCall::UnregisterDynamicOutline { name } => {
                     self.unregister_dynamic_outline(name);
                     true
@@ -532,6 +631,35 @@ fn sat_outline_vs_outline(
         }
     }
     total
+}
+
+fn circle_overlaps_outline(
+    circle_center: Vec2,
+    circle_radius: f32,
+    outline: &CollisionOutline,
+    outline_pos: Vec2,
+    outline_rot: f32,
+) -> bool {
+    if circle_radius <= 0.0 {
+        return false;
+    }
+
+    let circle = circle_polygon(circle_center, circle_radius, 20);
+    outline.world_hulls(outline_pos, outline_rot).iter()
+        .any(|hull| sat_convex_vs_convex(&circle, hull).is_some())
+}
+
+fn circle_polygon(center: Vec2, radius: f32, segments: usize) -> Vec<Vec2> {
+    let segment_count = segments.max(8);
+    (0..segment_count)
+        .map(|i| {
+            let angle = (i as f32 / segment_count as f32) * std::f32::consts::TAU;
+            Vec2::new(
+                center.x + angle.cos() * radius,
+                center.y + angle.sin() * radius,
+            )
+        })
+        .collect()
 }
 
 fn sat_aabb_vs_outline(
@@ -605,20 +733,63 @@ fn build_collision_outline(
     threshold:     u8,
     rdp_epsilon:   f32,
 ) -> Option<CollisionOutline> {
-    let mask       = build_binary_mask(rgba_pixels, sprite_width, sprite_height, threshold);
-    let border     = extract_border_pixels(&mask, sprite_width, sprite_height);
+    let mut mask   = build_binary_mask(rgba_pixels, sprite_width, sprite_height, threshold);
+    if !mask.iter().any(|&v| v) { return None; }
+    mask = maybe_remove_edge_background_by_color(
+        rgba_pixels,
+        sprite_width,
+        sprite_height,
+        &mask,
+        threshold,
+    );
+    if !mask.iter().any(|&v| v) { return None; }
+    mask = keep_largest_mask_component(&mask, sprite_width, sprite_height);
+    let border = extract_border_pixels(&mask, sprite_width, sprite_height);
     if border.len() < 3 { return None; }
-    let contour    = trace_contour(&border);
+    let mut contour = trace_contour(&border);
+    let used_convex_hull = contour.len() < 3 || contour_has_large_jumps(&contour);
+    if used_convex_hull {
+        contour = convex_hull_points(&border);
+    }
     if contour.len() < 3 { return None; }
-    let simplified = rdp_simplify(&contour, rdp_epsilon);
+    let mut simplified = if used_convex_hull {
+        rdp_simplify_closed(&contour, rdp_epsilon)
+    } else {
+        rdp_simplify(&contour, rdp_epsilon)
+    };
+    if simplified.len() < 4 {
+        let hull = convex_hull_points(&border);
+        if hull.len() >= 3 { simplified = hull; } else { return None; }
+    }
     let simplified = dedup_close_vertices(&simplified, 1.5);
     if simplified.len() < 3 { return None; }
-    let local      = pixels_to_local_space(&simplified, sprite_width, sprite_height, object_size);
-    let hulls      = convex_decompose(&local);
+    let mut local = pixels_to_local_space(&simplified, sprite_width, sprite_height, object_size);
+    if used_convex_hull {
+        local = convex_hull_float(&local);
+        if local.len() < 3 { return None; }
+    }
+    let outer_hull = convex_hull_float(&local);
+    let hulls = if outer_hull.len() >= 3 {
+        let local_area = polygon_area_abs(&local);
+        let outer_area = polygon_area_abs(&outer_hull);
+        let near_convex = outer_area > 1e-3 && (local_area / outer_area) >= 0.94;
+        if near_convex {
+            vec![outer_hull]
+        } else {
+            convex_decompose(&local)
+        }
+    } else {
+        convex_decompose(&local)
+    };
     if hulls.is_empty() { return None; }
     Some(CollisionOutline {
         data: Arc::new(CollisionOutlineData {
-            hulls, sprite_width, sprite_height, threshold, rdp_epsilon,
+            hulls,
+            object_size,
+            sprite_width,
+            sprite_height,
+            threshold,
+            rdp_epsilon,
         }),
     })
 }
@@ -723,7 +894,12 @@ fn dedup_close_vertices(points: &[(i32, i32)], min_dist: f32) -> Vec<(i32, i32)>
 
 fn pixels_to_local_space(poly: &[(i32, i32)], sw: u32, sh: u32, size: (f32, f32)) -> Vec<Vec2> {
     let (sx, sy) = (size.0 / sw.max(1) as f32, size.1 / sh.max(1) as f32);
-    poly.iter().map(|&(px, py)| Vec2::new(px as f32 * sx, py as f32 * sy)).collect()
+    let (cx, cy) = (size.0 * 0.5, size.1 * 0.5);
+    poly.iter()
+        .map(|&(px, py)| {
+            Vec2::new((px as f32 + 0.5) * sx - cx, (py as f32 + 0.5) * sy - cy)
+        })
+        .collect()
 }
 
 fn convex_decompose(polygon: &[Vec2]) -> Vec<Vec<Vec2>> {
@@ -791,6 +967,272 @@ fn point_in_polygon(p: &Vec2, poly: &[Vec2]) -> bool {
         j = i;
     }
     inside
+}
+
+fn maybe_remove_edge_background_by_color(
+    pixels: &[u8],
+    width: u32,
+    height: u32,
+    mask: &[bool],
+    threshold: u8,
+) -> Vec<bool> {
+    let w = width as usize;
+    let h = height as usize;
+    if w == 0 || h == 0 || mask.is_empty() {
+        return mask.to_vec();
+    }
+
+    let occupied = mask.iter().filter(|&&v| v).count();
+    let area = w * h;
+    if (occupied as f32) / (area as f32) < 0.90 {
+        return mask.to_vec();
+    }
+
+    let pixel_rgb = |idx: usize| -> (i32, i32, i32) {
+        let base = idx * 4;
+        (pixels[base] as i32, pixels[base + 1] as i32, pixels[base + 2] as i32)
+    };
+    let idx_of = |x: usize, y: usize| -> usize { y * w + x };
+
+    let c00 = pixel_rgb(idx_of(0, 0));
+    let c10 = pixel_rgb(idx_of(w - 1, 0));
+    let c01 = pixel_rgb(idx_of(0, h - 1));
+    let c11 = pixel_rgb(idx_of(w - 1, h - 1));
+    let bg = (
+        (c00.0 + c10.0 + c01.0 + c11.0) / 4,
+        (c00.1 + c10.1 + c01.1 + c11.1) / 4,
+        (c00.2 + c10.2 + c01.2 + c11.2) / 4,
+    );
+
+    let is_bg_like = |idx: usize| -> bool {
+        let base = idx * 4;
+        let alpha = pixels[base + 3];
+        if alpha <= threshold {
+            return false;
+        }
+        let (r, g, b) = pixel_rgb(idx);
+        let dr = r - bg.0;
+        let dg = g - bg.1;
+        let db = b - bg.2;
+        dr * dr + dg * dg + db * db <= 5_200
+    };
+
+    let mut visited = vec![false; area];
+    let mut stack: Vec<(usize, usize)> = Vec::new();
+
+    for x in 0..w {
+        stack.push((x, 0));
+        if h > 1 { stack.push((x, h - 1)); }
+    }
+    for y in 1..h.saturating_sub(1) {
+        stack.push((0, y));
+        if w > 1 { stack.push((w - 1, y)); }
+    }
+
+    while let Some((x, y)) = stack.pop() {
+        let idx = idx_of(x, y);
+        if visited[idx] || !mask[idx] || !is_bg_like(idx) {
+            continue;
+        }
+        visited[idx] = true;
+
+        if x > 0 { stack.push((x - 1, y)); }
+        if x + 1 < w { stack.push((x + 1, y)); }
+        if y > 0 { stack.push((x, y - 1)); }
+        if y + 1 < h { stack.push((x, y + 1)); }
+    }
+
+    let mut cleaned = vec![false; area];
+    let mut kept = 0usize;
+    for i in 0..area {
+        let v = mask[i] && !visited[i];
+        cleaned[i] = v;
+        if v { kept += 1; }
+    }
+
+    let kept_ratio = kept as f32 / area as f32;
+    if kept < 3 || !(0.015..=0.97).contains(&kept_ratio) {
+        return mask.to_vec();
+    }
+
+    cleaned
+}
+
+fn contour_has_large_jumps(contour: &[(i32, i32)]) -> bool {
+    if contour.len() < 4 {
+        return false;
+    }
+    let mut max_step = 0.0f32;
+    let mut sum_step = 0.0f32;
+    let mut count = 0usize;
+    for w in contour.windows(2) {
+        let dx = (w[1].0 - w[0].0) as f32;
+        let dy = (w[1].1 - w[0].1) as f32;
+        let d = (dx * dx + dy * dy).sqrt();
+        if d > max_step { max_step = d; }
+        sum_step += d;
+        count += 1;
+    }
+    if count == 0 {
+        return false;
+    }
+    let avg_step = sum_step / count as f32;
+    max_step > 6.0 && max_step > avg_step * 4.5
+}
+
+fn keep_largest_mask_component(mask: &[bool], width: u32, height: u32) -> Vec<bool> {
+    let w = width as i32;
+    let h = height as i32;
+    if w <= 0 || h <= 0 || mask.is_empty() {
+        return vec![];
+    }
+
+    let mut visited = vec![false; mask.len()];
+    let mut largest: Vec<usize> = Vec::new();
+
+    for y in 0..h {
+        for x in 0..w {
+            let idx = (y * w + x) as usize;
+            if visited[idx] || !mask[idx] {
+                continue;
+            }
+
+            let mut stack: Vec<(i32, i32)> = vec![(x, y)];
+            visited[idx] = true;
+            let mut component: Vec<usize> = Vec::new();
+
+            while let Some((cx, cy)) = stack.pop() {
+                let cidx = (cy * w + cx) as usize;
+                component.push(cidx);
+
+                for (nx, ny) in [(cx - 1, cy), (cx + 1, cy), (cx, cy - 1), (cx, cy + 1)] {
+                    if nx < 0 || nx >= w || ny < 0 || ny >= h {
+                        continue;
+                    }
+                    let nidx = (ny * w + nx) as usize;
+                    if visited[nidx] || !mask[nidx] {
+                        continue;
+                    }
+                    visited[nidx] = true;
+                    stack.push((nx, ny));
+                }
+            }
+
+            if component.len() > largest.len() {
+                largest = component;
+            }
+        }
+    }
+
+    let mut cleaned = vec![false; mask.len()];
+    for idx in largest {
+        cleaned[idx] = true;
+    }
+    cleaned
+}
+
+fn rdp_simplify_closed(points: &[(i32, i32)], epsilon: f32) -> Vec<(i32, i32)> {
+    if points.len() <= 3 { return points.to_vec(); }
+    let p0 = points[0];
+    let mut max_dist_sq = 0i64;
+    let mut far_idx = points.len() / 2;
+    for i in 1..points.len() {
+        let dx = (points[i].0 - p0.0) as i64;
+        let dy = (points[i].1 - p0.1) as i64;
+        let d2 = dx * dx + dy * dy;
+        if d2 > max_dist_sq { max_dist_sq = d2; far_idx = i; }
+    }
+    if max_dist_sq == 0 { return points[..1].to_vec(); }
+    let simp_a = rdp_simplify(&points[..=far_idx], epsilon);
+    let mut half_b: Vec<(i32, i32)> = points[far_idx..].to_vec();
+    half_b.push(p0);
+    let simp_b = rdp_simplify(&half_b, epsilon);
+    let mut result = simp_a;
+    result.pop();
+    if simp_b.len() > 1 {
+        result.extend_from_slice(&simp_b[..simp_b.len() - 1]);
+    }
+    result
+}
+
+fn convex_hull_points(points: &[(i32, i32)]) -> Vec<(i32, i32)> {
+    let mut pts: Vec<(i32, i32)> = points.to_vec();
+    pts.sort_unstable();
+    pts.dedup();
+    if pts.len() < 3 { return pts; }
+
+    fn cross(o: (i32, i32), a: (i32, i32), b: (i32, i32)) -> i64 {
+        (a.0 as i64 - o.0 as i64) * (b.1 as i64 - o.1 as i64)
+            - (a.1 as i64 - o.1 as i64) * (b.0 as i64 - o.0 as i64)
+    }
+
+    let mut lower: Vec<(i32, i32)> = Vec::new();
+    for &p in &pts {
+        while lower.len() >= 2 && cross(lower[lower.len() - 2], *lower.last().unwrap(), p) <= 0 {
+            lower.pop();
+        }
+        lower.push(p);
+    }
+
+    let mut upper: Vec<(i32, i32)> = Vec::new();
+    for &p in pts.iter().rev() {
+        while upper.len() >= 2 && cross(upper[upper.len() - 2], *upper.last().unwrap(), p) <= 0 {
+            upper.pop();
+        }
+        upper.push(p);
+    }
+
+    lower.pop();
+    upper.pop();
+    lower.extend(upper);
+    lower
+}
+
+fn convex_hull_float(points: &[Vec2]) -> Vec<Vec2> {
+    if points.len() < 3 { return points.to_vec(); }
+    let mut pts: Vec<Vec2> = points.to_vec();
+    pts.sort_by(|a, b| {
+        a.x.partial_cmp(&b.x)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then(a.y.partial_cmp(&b.y).unwrap_or(std::cmp::Ordering::Equal))
+    });
+    pts.dedup_by(|a, b| (a.x - b.x).abs() < 1e-4 && (a.y - b.y).abs() < 1e-4);
+    if pts.len() < 3 { return pts; }
+    #[inline]
+    fn cross_f(o: Vec2, a: Vec2, b: Vec2) -> f32 {
+        (a.x - o.x) * (b.y - o.y) - (a.y - o.y) * (b.x - o.x)
+    }
+    let mut lower: Vec<Vec2> = Vec::new();
+    for &p in &pts {
+        while lower.len() >= 2 && cross_f(lower[lower.len() - 2], *lower.last().unwrap(), p) <= 0.0 {
+            lower.pop();
+        }
+        lower.push(p);
+    }
+    let mut upper: Vec<Vec2> = Vec::new();
+    for &p in pts.iter().rev() {
+        while upper.len() >= 2 && cross_f(upper[upper.len() - 2], *upper.last().unwrap(), p) <= 0.0 {
+            upper.pop();
+        }
+        upper.push(p);
+    }
+    lower.pop();
+    upper.pop();
+    lower.extend(upper);
+    lower
+}
+
+fn polygon_area_abs(points: &[Vec2]) -> f32 {
+    if points.len() < 3 {
+        return 0.0;
+    }
+    let mut twice_area = 0.0f32;
+    for i in 0..points.len() {
+        let a = points[i];
+        let b = points[(i + 1) % points.len()];
+        twice_area += a.x * b.y - a.y * b.x;
+    }
+    twice_area.abs() * 0.5
 }
 
 fn split_polygon(polygon: &[Vec2], i: usize, j: usize) -> (Vec<Vec2>, Vec<Vec2>) {
